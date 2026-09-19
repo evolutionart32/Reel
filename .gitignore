@@ -1,0 +1,44 @@
+# Secrets — the ElevenLabs key lives here, never in git
+.claude/skills/video-use/.env
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Node / Remotion / HyperFrames (installed on demand, never vendored)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Manim render artifacts
+media/
+*.log
+
+# video-use session outputs (normally land in <videos_dir>/edit/)
+edit/
+transcripts/
+animations/
+clips_graded/
+clips_preview/
+downloads/
+verify/
+preview.mp4
+final.mp4
+base.mp4
+base_preview.mp4
+master.srt
+takes_packed.md
+edl.json
+project.md
