@@ -56,7 +56,7 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
 
 def probe(path: Path) -> dict:
     out = run(["ffprobe", "-v", "error", "-show_entries",
-               "format=duration:stream=codec_type,width,height", "-of", "json", str(path)])
+               "format=duration:stream=codec_type,width,height,disposition", "-of", "json", str(path)])
     return json.loads(out.stdout)
 
 
@@ -104,7 +104,8 @@ def render_title(text: str, out_png: Path) -> None:
     img.save(out_png)
 
 
-def normalize(src: Path, dst: Path, trim: tuple[float, float] | None) -> None:
+def normalize(src: Path, dst: Path, trim: tuple[float, float] | None,
+              grade: str | None = None) -> None:
     """Scale-and-crop one source to the 1080x1920 frame at a fixed rate.
 
     Segments have to share codec, rate and geometry or the lossless concat
@@ -113,18 +114,24 @@ def normalize(src: Path, dst: Path, trim: tuple[float, float] | None) -> None:
     cmd = ["ffmpeg", "-v", "error", "-y"]
     if trim:
         cmd += ["-ss", f"{trim[0]:.3f}", "-t", f"{trim[1] - trim[0]:.3f}"]
+    silent = not has_audio(src)
+    cmd += ["-i", str(src)]
+    if silent:
+        cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+    # Map the first real video and audio stream explicitly. Drone files carry
+    # an embedded JPEG thumbnail and telemetry streams that default stream
+    # selection happily picks up.
+    cmd += ["-map", "0:v:0", "-map", ("1:a:0" if silent else "0:a:0")]
     cmd += [
-        "-i", str(src),
         "-vf", (f"scale={W}:{H}:force_original_aspect_ratio=increase:flags=lanczos,"
-                f"crop={W}:{H},fps={FPS},format=yuv420p"),
+                f"crop={W}:{H},fps={FPS},format=yuv420p" + (f",{grade}" if grade else "")),
         "-c:v", "libx264", "-preset", "medium", "-crf", "16",
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-        "-movflags", "+faststart", str(dst),
+        "-movflags", "+faststart",
     ]
-    if not has_audio(src):
-        # Give silent sources a track anyway, so concat sees uniform streams.
-        cmd[cmd.index("-i"):cmd.index("-i")] = ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+    if silent:
         cmd += ["-shortest"]
+    cmd += [str(dst)]
     run(cmd)
 
 
@@ -155,6 +162,11 @@ def main() -> None:
     ap.add_argument("--no-end-fade", action="store_true")
     ap.add_argument("--title-in", type=float, default=TITLE_IN)
     ap.add_argument("--title-out", type=float, default=TITLE_OUT_END)
+    ap.add_argument("--grade", action="append", default=[],
+                    help="raw ffmpeg filter chain, e.g. 'eq=contrast=1.06:saturation=1.05'. "
+                         "Give it once for every source, or once per source when the clips "
+                         "need matching to each other.")
+    ap.add_argument("--mute", action="store_true", help="drop source audio (drone clips carry only noise)")
     ap.add_argument("--draft", action="store_true", help="720p ultrafast, for checking cuts")
     args = ap.parse_args()
 
@@ -163,6 +175,8 @@ def main() -> None:
             sys.exit(f"no such source: {src}")
     if args.trim and len(args.trim) != len(args.sources):
         sys.exit("--trim must be repeated once per source, in the same order")
+    if len(args.grade) not in (0, 1, len(args.sources)):
+        sys.exit("--grade takes either one chain for every source or one per source")
 
     workdir = Path(tempfile.mkdtemp(prefix="reel_"))
     try:
@@ -173,7 +187,12 @@ def main() -> None:
                 start, end = args.trim[i].split(":")
                 trim = (float(start), float(end))
             seg = workdir / f"seg_{i:02d}.mp4"
-            normalize(src, seg, trim)
+            grade = None
+            if len(args.grade) == 1:
+                grade = args.grade[0]
+            elif args.grade:
+                grade = args.grade[i]
+            normalize(src, seg, trim, grade)
             segments.append(seg)
 
         base = workdir / "base.mp4"
@@ -191,7 +210,8 @@ def main() -> None:
             hold = max(0.0, args.title_out - args.title_in)
             if hold <= TITLE_FADE_OUT:
                 sys.exit("title window is shorter than its fade-out")
-            inputs += ["-loop", "1", "-t", f"{hold:.3f}", "-i", str(title_png)]
+            inputs += ["-loop", "1", "-framerate", str(FPS), "-t", f"{hold:.3f}",
+                       "-i", str(title_png)]
             # Rule: shift the overlay's own frame 0 to its window start, or the
             # overlay plays from its middle.
             filters.append(
@@ -201,7 +221,7 @@ def main() -> None:
                 f"setpts=PTS-STARTPTS+{args.title_in}/TB[title]"
             )
             filters.append(
-                f"[{vlast}][title]overlay=0:0:"
+                f"[{vlast}][title]overlay=0:0:eof_action=pass:"
                 f"enable='between(t,{args.title_in},{args.title_out})'[vt]"
             )
             vlast, idx = "vt", idx + 1
@@ -209,10 +229,16 @@ def main() -> None:
         if not args.no_badge:
             if not args.badge.exists():
                 sys.exit(f"no badge asset at {args.badge}")
-            inputs += ["-i", str(args.badge)]
+            # Run the badge past the end of the picture and let shortest=1 cut the
+            # chain when the base runs out. A single-frame input instead relies on
+            # overlay repeating its last frame, which stops holding once an earlier
+            # overlay in the chain has ended; matching the durations exactly runs
+            # into the opposite failure, where overlay pads the tail with black.
+            inputs += ["-loop", "1", "-framerate", str(FPS), "-t", f"{total + 1:.3f}",
+                       "-i", str(args.badge)]
             filters.append(f"[{idx}:v]format=rgba,scale={BADGE_W}:-1[badge]")
             filters.append(
-                f"[{vlast}][badge]overlay={BADGE_X}:H-h-{BADGE_BOTTOM}[vb]"
+                f"[{vlast}][badge]overlay={BADGE_X}:H-h-{BADGE_BOTTOM}:shortest=1[vb]"
             )
             vlast, idx = "vb", idx + 1
 
@@ -240,14 +266,18 @@ def main() -> None:
             else:
                 filters.append(bed + "[amix]")
                 asrc = "amix"
+        elif args.mute:
+            inputs += ["-f", "lavfi", "-t", f"{total:.3f}", "-i", "anullsrc=r=48000:cl=stereo"]
+            filters.append(f"[{idx}:a]asetpts=PTS-STARTPTS[amix]")
+            idx += 1
+            asrc = "amix"
         else:
             filters.append(f"[0:a]atrim=0:{total:.3f},asetpts=PTS-STARTPTS[amix]")
             asrc = "amix"
 
         tail = "" if args.no_end_fade else f",afade=t=out:st={total - END_FADE:.3f}:d={END_FADE}"
-        filters.append(
-            f"[{asrc}]loudnorm=I=-14:TP=-1:LRA=11{tail}[aout]"
-        )
+        norm = "" if (args.mute and not args.music) else "loudnorm=I=-14:TP=-1:LRA=11,"
+        filters.append(f"[{asrc}]{norm}anull{tail}[aout]")
 
         vcodec = (["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28"]
                   if args.draft else
